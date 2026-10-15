@@ -5064,7 +5064,7 @@ function renderStatusEditor(){
   qs('#add-status-tile').onclick = ()=>{
     openStatusModal({
       id:newId(), name:'新しい状態', emoji:'✨', target:'self', perTurnDelta:0,
-      effects:[newStatusEffect('damageDealtFlat')],
+      effects:[],   // 効果なしから始める（効果は、編集画面で追加する）
     }, true);
   };
 }
