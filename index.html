@@ -567,6 +567,8 @@ const SETTING_TOGGLES = [
   {key:'skipTokenEnabled', label:'報酬をスキップするとリロールトークンを獲得する', def:true},
   {key:'shopRerollEnabled', label:'ショップの商品入れ替えを有効にする', def:true},
   {key:'charRelicInShop', label:'キャラクタータグを解放するレリックを、ショップにも並べる（オフなら、ショップには出ない）', def:false},
+  {key:'formationRandomFull', label:'キャラクター編成に「ランダム（完全ランダム）」を出す（メインと解放枠で、ゲーム開始時に自動で1人決まる）', def:false},
+  {key:'formationRandomChoose', label:'キャラクター編成に「ランダム（選択肢から選ぶ）」を出す（ランダムな数人から、ゲーム開始時に1人を選ぶ）', def:false},
   {key:'startPickEnabled', label:'ゲーム開始時に、カードを1枚選んでデッキに加える', def:false},
   {key:'tagAffinityEnabled', label:'手に入れたカード（開始デッキを除く）と同じタグのカードが、報酬・ショップで出やすくなる', def:false},
   {key:'tagAffinityExcludeType', label:'　└ 出現率の上昇の対象から、分類タグ（アタック・スキル・パワー）を外す', def:true},
@@ -783,7 +785,10 @@ function loadCharTags(){
 function saveCharTags(list){ try{ localStorage.setItem('charTags', JSON.stringify(list)); }catch(e){ console.error(e); storageFailed(); } }
 function cleanFormation(o){
   o = (o && typeof o==='object') ? o : {};
-  return {mainId: (typeof o.mainId==='string' && validSaveId(o.mainId)) ? o.mainId : '', skipMain: !!o.skipMain, unlocked: cleanIdList(o.unlocked)};
+  return {mainId: (typeof o.mainId==='string' && validSaveId(o.mainId)) ? o.mainId : '', skipMain: !!o.skipMain, unlocked: cleanIdList(o.unlocked),
+    mainMode: (o.mainMode==='random' || o.mainMode==='choose') ? o.mainMode : 'fixed',   // メイン枠: 固定／完全ランダム／選択肢から選ぶ
+    unlockRandom: (Array.isArray(o.unlockRandom) ? o.unlockRandom : []).filter(m=>m==='random' || m==='choose').slice(0,8),   // ランダムに解放する枠
+    randomChoices: clampInt(o.randomChoices, 2, 6, 3)};   // 「選択肢から選ぶ」の選択肢の数
 }
 function cleanFormationData(o){
   o = (o && typeof o==='object') ? o : {};
@@ -876,7 +881,7 @@ function saveCards(cards){
 function loadSettings(){
   try{
     const value = localStorage.getItem('settings');
-    if(value) return Object.assign({}, DEFAULT_SETTINGS, JSON.parse(value));
+    if(value){ const o = JSON.parse(value); if(o && o.formationRandom===true && !('formationRandomFull' in o)){ o.formationRandomFull = true; o.formationRandomChoose = true; } return Object.assign({}, DEFAULT_SETTINGS, o); }
   }catch(e){ console.error(e); }
   return {...DEFAULT_SETTINGS};
 }
@@ -1296,7 +1301,7 @@ const S = {
   enemies: [],
   events: [],
   charTags: [],
-  formation: {mainId:'', skipMain:false, unlocked:[]},
+  formation: {mainId:'', skipMain:false, unlocked:[], mainMode:'fixed', unlockRandom:[], randomChoices:3},
   formationPresets: [],
   settings: {...DEFAULT_SETTINGS},
   world: {...DEFAULT_WORLD},
@@ -1526,6 +1531,59 @@ function thenOpText(t){
     case 'costChange': return `コストを${x}${sg(t.costDelta|0)}${perm}`;
   }
   return t.type;
+}
+// ===== カード操作でカードを選ぶ画面の、ガイド表示 =====
+// 何を（どの山の、どんなカードを何枚）選ぶのか、選んだカードをどうするのか、続けて何をするのかを、選択画面の上に出す。
+// ctx: stage='count'（枚数を選ぶ操作）／'pick'（対象が決まったあとの「さらに選ぶ」）、total＝候補の枚数、need＝選ぶ枚数
+function cardOpGuideAction(op){
+  const sg = n=> n>=0 ? `+${n}` : `${n}`;
+  switch(op.type){
+    case 'moveToHand': return '手札に移動する';
+    case 'moveToDiscard': return '捨て札に移動する';
+    case 'moveToDraw': return '山札に加える（シャッフル）';
+    case 'moveToDrawTop': return '山札の一番上に置く（次に引くカードになる）';
+    case 'moveToExhausted': return op.exhaustMode==='stay' ? '消滅させる（永続：戦闘後も復活しない）' : op.exhaustMode==='destroy' ? '消滅させる（デッキから完全に取り除く）' : '消滅させる（この戦闘中。戦闘後に復活する）';
+    case 'captureEffect': return `効果を取得する（${(op.captureFields||[]).includes(CAPTURE_ALL) ? 'すべての効果' : (op.captureFields||[]).map(k=>{ const d = allEffectFieldDefs().find(x=>x.key===k); return d ? d.label : k; }).join('・')}）`;
+    case 'generateToHand': return '生成して、手札に加える';
+    case 'generateToDraw': return '生成して、山札に加える（シャッフル）';
+    case 'generatePlay': return '生成して、コストを消費せず使用する';
+    case 'generateToEnemyDeck': return '生成して、敵のデッキに加える（この戦闘中のみ）';
+    case 'grantBuff': {
+      const life = op.permanent ? '（永続）' : '（この戦闘中のみ）';
+      if(op.buffSource!=='captured' && onlyAddTags(op)) return `${extraGrantParts(op).join('し、')}する${life}`;   // タグ・保持・消滅だけ変える
+      if(op.buffSource!=='captured' && op.buffMode==='set' && op.buffField){
+        const fd = allEffectFieldDefs().find(d=>d.key===op.buffField);
+        return `「${fd ? fd.label : op.buffField}」を${op.buffAmount||0}に上書きする${addTagsText(op)}${life}`;
+      }
+      if(op.buffSource==='captured') return `取得した効果を${op.buffMode==='set' ? '上書き' : '加算'}で付与する${life}`;
+      const fd = allEffectFieldDefs().find(d=>d.key===op.buffField);
+      return `「${fd ? fd.label : op.buffField}」を${op.valueMode==='targetCount' ? '対象の枚数×' : ''}${sg(op.buffAmount||0)}する${addTagsText(op)}${life}`;
+    }
+    case 'costChange': return `コストを${(op.valueMode==='targetCount' ? '対象の枚数×' : '')}${sg(op.costDelta|0)}する${op.permanent ? '（永続）' : '（この戦闘中のみ）'}`;
+  }
+  const t = thenOpText(op);
+  return CARDOP_REVERTIBLE_TYPES.includes(op.type) && !op.permanent ? `${t}（この戦闘中のみ）` : t;
+}
+function cardOpGuide(op, ctx){
+  ctx = ctx || {};
+  const isGen = GENERATE_TYPES.includes(op.type);
+  const tagText = tagCondText(op.filterTag, op.filterTagMode);
+  const rangeLabel = isGen ? genPoolLabel(op) : ((PILE_OPTIONS.find(p=>p.key===op.fromPile)||{}).label || '');
+  const need = Math.max(1, ctx.need|0 || 1);
+  const upto = op.pickOptional ? 'まで（選ばなくてもよい）' : '';
+  let target;
+  if(ctx.stage==='pick') target = `対象になった${ctx.total}枚のカードの中から、${need}枚${upto}を選びます`;
+  else if(isGen) target = `${rangeLabel}${tagText ? `（${tagText.slice(0,-1)}）` : ''}の候補${ctx.total}枚から、${need}枚${upto}を選びます`;
+  else target = `${rangeLabel}の${tagText}カード${ctx.total}枚から、${need}枚${upto}を選びます`;
+  return {target, action: cardOpGuideAction(op), then: (op._guideThen || op.then || []).map(thenOpText)};   // 続けの操作がある操作は、内側で then を空にして呼び直すので、_guideThen に控えてある
+}
+function cardOpGuideHTML(g){
+  if(!g) return '';
+  return `<div class="choice-guide" style="max-width:600px; margin:8px auto 14px; text-align:left; border:1px solid var(--line); border-radius:8px; padding:8px 14px; background:var(--bg-panel-raised); font-size:13px; line-height:1.8;">
+    <div><span style="color:var(--gold);">選ぶもの</span>　${escapeHtml(g.target)}</div>
+    <div><span style="color:var(--gold);">選んだカードを</span>　<b>${escapeHtml(g.action)}</b></div>
+    ${(g.then||[]).length ? `<div><span style="color:var(--gold);">そのあと同じカードに</span>　${g.then.map(escapeHtml).join(' → ')}</div>` : ''}
+  </div>`;
 }
 function cardOpDescParts(op){
   const parts = cardOpDescPartsBase(op);
@@ -1847,6 +1905,9 @@ function normalizeRelic(r){
   r.turnN = clampInt(r.turnN,1,99,1);
   r.useLimit = clampInt(r.useLimit,0,99,0);                                  // 使える回数の上限（0で無制限）
   r.useScope = ['run','round','battle'].includes(r.useScope) ? r.useScope : 'run';   // 回数を数える範囲
+  r.grantOptIds = cleanIdListDup(r.grantOptIds);
+  r.grantForceIds = cleanIdListDup(r.grantForceIds);
+  r.grantAtStart = !!r.grantAtStart;
   r.shopPrice = clampInt(r.shopPrice,0,9999,0);                              // ショップでの価格（0で標準）
   return r;
 }
@@ -1923,13 +1984,6 @@ function normalizeStatusOp(o){
       .map(t=>normalizeStatusOp({...t, then:[], countMode:'all', fromPile:'hand', sequential:false, filterTag:'', pickMode:'none'}))} : {}),
   };
 }
-// 反射（reflectDamage）で「何を与えるか」: 'damage'（既定）／組み込みの 'weak'・'vulnerable'・'poison'／'cs:<カスタム状態ID>'
-const REFLECT_BUILTIN_GIVES = ['weak','vulnerable','poison'];
-function cleanReflectGive(v){
-  if(typeof v!=='string') return 'damage';
-  if(REFLECT_BUILTIN_GIVES.includes(v)) return v;
-  return /^cs:[A-Za-z0-9_-]{1,64}$/.test(v) ? v : 'damage';
-}
 function normalizeStatusEffect(x){
   if(!x || typeof x!=='object') return null;
   if(x.kind!=='cardOp' && !CUSTOM_STATUS_KINDS.some(k=>k.key===x.kind)) return null;
@@ -1947,7 +2001,6 @@ function normalizeStatusEffect(x){
     if(x.kind==='elGrant' && e.element==='all') e.element = '';   // 付与に「全属性」はない
   }
   if(x.kind==='keepBlock') e.keepCap = clampInt(x.keepCap,0,9999,0);   // 持ち越す最大値（0で上限なし）
-  if(x.kind==='reflectDamage') e.reflectGive = cleanReflectGive(x.reflectGive);   // 何を与えるか（旧データは 'damage'）
   if(x.kind==='cardMod' || x.kind==='cardModPct'){
     e.modField = (typeof x.modField==='string' && x.modField) ? x.modField.slice(0,80) : 'damage';
     e.modTag = cleanTagList(x.modTag);
@@ -1955,12 +2008,38 @@ function normalizeStatusEffect(x){
     e.decayOnUse = !!x.decayOnUse;
     e.decayN = clampInt(x.decayN,1,99,1);
   }
+  if(x.kind==='reflectDamage'){   // 攻撃を受けた時の反応。値は「固定値」「受けたダメージの％」「ブロックで防いだ値の％」から決める
+    e.rxBasis = ['taken','blocked'].includes(x.rxBasis) ? x.rxBasis : 'fixed';
+    e.rxTarget = x.rxTarget==='self' ? 'self' : 'opponent';
+    e.reactions = (Array.isArray(x.reactions) ? x.reactions : []).slice(0,12).map(normalizeReaction).filter(Boolean);
+    // 12c〜12f の旧形式（reflectGive＝何を与えるか。ダメージ以外は、固定値／スタック数×係数で状態を付与）を、追加の効果へ変換する。
+    // 変換後は reflectGive を持たないので、もう一度正規化しても二重に変換されない。
+    const lg = x.reflectGive;
+    if(typeof lg==='string' && lg!=='damage' && !Array.isArray(x.reactions)){
+      const field = ['weak','vulnerable','poison'].includes(lg) ? lg : (/^cs:[A-Za-z0-9_-]{1,64}$/.test(lg) ? 'cs_'+lg.slice(3) : '');
+      if(field){
+        e.reactions = [normalizeReaction({field, target:'opponent', source:'fixed', amount:e.magnitudeValue, perStack:e.magnitudeMode==='perStack'})];
+        e.magnitudeValue = 0; e.magnitudeMode = 'fixed';   // 本体のダメージは返さず、追加の効果だけが働く
+      }
+    }
+  }
   if(x.kind==='revive'){
     e.reviveUnit = x.reviveUnit==='percent' ? 'percent' : 'fixed';
     e.reviveGrants = (Array.isArray(x.reviveGrants) ? x.reviveGrants : []).filter(g=> g && typeof g.statusId==='string')
       .map(g=>({statusId:g.statusId, stacks:clampInt(g.stacks,1,99,1)}));
   }
   return e;
+}
+function normalizeReaction(g){
+  if(!g || typeof g!=='object' || typeof g.field!=='string' || !g.field) return null;
+  const n = Number(g.amount);
+  return {
+    field: g.field.slice(0,80),
+    target: g.target==='self' ? 'self' : 'opponent',
+    source: ['taken','blocked'].includes(g.source) ? g.source : 'fixed',
+    amount: isFinite(n) ? Math.max(-999, Math.min(999, Math.round(n*100)/100)) : 0,
+    perStack: g.perStack!==false,
+  };
 }
 function parseExclTags(v){ return Array.isArray(v) ? v.map(cleanTag).filter((t,i,a)=>t && a.indexOf(t)===i) : parseTags(v); }
 function normalizeCustomStatus(st){
@@ -2749,7 +2828,7 @@ const CUSTOM_STATUS_KINDS = [
   {key:'keepBlock', label:'自分のターン開始時、残ったブロックを持ち越す（効果量が持ち越す割合％。100ですべて。最大値も設定できる）'},
   {key:'turnStartDamage', label:'自分のターン開始時にダメージを受ける（毒のように）'},
   {key:'turnStartHeal', label:'自分のターン開始時にHPを回復する（再生のように）'},
-  {key:'reflectDamage', label:'攻撃を受けた時に、攻撃した相手へ与える（棘のように。ダメージ、または状態を選べる）'},
+  {key:'reflectDamage', label:'攻撃を受けた時に反応する（棘のように、反射ダメージを与える。値の決め方・与える先・追加の効果を設定できる）'},
   {key:'skipTurn', label:'自分のターンを1回休む（麻痺のように、数値は無視）'},
   {key:'revive', label:'HPが0になったとき復活する（発動のたびにスタックを1消費。効果量が復活時のHP）'},
   {key:'cardMod', label:'使うカードの効果を固定値増減する（指定タグのカードだけに働かせることもできる。効果量が増減する量）'},
@@ -3173,36 +3252,77 @@ function customDamageDealtBonus(entity, elems){
 function customDamageTakenPct(entity, elems){ return customEffectSum(entity,'damageTakenPct') + elementEffectSum(entity,'elTakenPct',elems); }
 function customDamageTakenFlat(entity, elems){ return customEffectSum(entity,'damageTakenFlat') + elementEffectSum(entity,'elTakenFlat',elems); }
 function customBlockGainBonus(entity){ return customEffectSum(entity,'blockGainFlat'); }
-// 反射（reflectDamage）: 攻撃を受けた持ち主が、攻撃した側へ返す。「何を与えるか」は reflectGive で決まる（旧データは damage）。
-// 値の決め方は、他の効果と同じ（固定値／スタック数×係数。小数は切り捨て）。
-function reflectGiveOf(eff){ return cleanReflectGive(eff && eff.reflectGive); }
-function reflectGiveName(give){
-  if(give==='damage') return 'ダメージ';
-  if(REFLECT_BUILTIN_GIVES.includes(give)) return bsName(give);
-  const gs = (S.customStatuses||[]).find(x=>'cs:'+x.id===give);
-  return gs ? `${gs.emoji||''}${gs.name}` : '（削除された状態）';
+function customReflectDamage(entity){ return customEffectSum(entity,'reflectDamage'); }
+// ===== 攻撃を受けた時の反応（reflectDamage の拡張） =====
+// 「何を与えるか」に選べる欄。カスタム状態（cs_<ID>）も選べる。付与先は、反応ごとの「与える先」で決める。
+function reactionFieldDefs(){
+  const b = id=> bsName(id);
+  return [
+    {key:'damage', label:'ダメージ（ブロック無視）'},
+    {key:'block', label:'ブロック'},
+    {key:'heal', label:'HP回復'},
+    {key:'strength', label:`${b('strength')}+（この戦闘中のみ）`},
+    {key:'dexterity', label:`${b('dexterity')}+（この戦闘中のみ）`},
+    {key:'metallicize', label:`${b('metallicize')}+（この戦闘中のみ）`},
+    {key:'thorns', label:`${b('thorns')}+（この戦闘中のみ）`},
+    {key:'weak', label:`${b('weak')}（ターン数）`},
+    {key:'vulnerable', label:`${b('vulnerable')}（ターン数）`},
+    {key:'poison', label:`${b('poison')}（ターン数）`},
+    {key:'regen', label:`${b('regen')}（ターン数）`},
+    {key:'stun', label:`${b('stun')}（ターン数）`},
+    {key:'draw', label:'ドロー枚数（与える先がプレイヤーのときだけ）'},
+    {key:'energy', label:'エネルギー（与える先がプレイヤーのときだけ）'},
+  ].concat((S.customStatuses||[]).map(st=>({key:'cs_'+st.id, label:`${st.emoji?st.emoji+' ':''}${st.name}（カスタム状態。マイナスでスタックを減らす）`})));
 }
-// ダメージを返す分の合計（ブロック無視で、攻撃した側のHPを直接減らす）
-function customReflectDamage(entity){
-  return customEffectsOn(entity,'reflectDamage').filter(x=>reflectGiveOf(x.eff)==='damage')
-    .reduce((sum,x)=> sum + customStatusMagnitude(x.eff, x.stacks), 0);
+function reactionFieldLabel(key){ const d = reactionFieldDefs().find(x=>x.key===key); return d ? d.label.replace(/（.*$/,'') : key; }
+function reactionFieldOptionsHTML(cur){
+  return reactionFieldDefs().map(d=>`<option value="${escapeHtml(d.key)}" ${cur===d.key?'selected':''}>${escapeHtml(d.label)}</option>`).join('');
 }
-// 状態を返す分: holder（攻撃を受けた側）の反射効果のうち、状態を与えるものを attacker（攻撃した側）に付与する。
-function applyReflectGrants(holder, attacker){
-  if(!holder || !attacker) return;
-  customEffectsOn(holder,'reflectDamage').forEach(x=>{
-    const give = reflectGiveOf(x.eff);
-    if(give==='damage' || attacker.hp<=0) return;
-    const n = Math.max(0, customStatusMagnitude(x.eff, x.stacks));
-    if(!(n>0)) return;
-    if(give.startsWith('cs:')){
-      const gs = (S.customStatuses||[]).find(s=>'cs:'+s.id===give);
-      if(!gs) return;
-      if(grantCustomStatus(attacker, gs.id, n)===0) return;   // 排他で付与されなかった
-    } else {
-      if(grantBuiltin(attacker, give, n)===0) return;
-    }
-    exclLog(`${x.st.emoji||''}${x.st.name}の反射で、${exclWho(attacker)}に${reflectGiveName(give)}+${n}を与えた。`);
+// 値の決め方: 固定値、または基準（受けたダメージ＝HPが減った分／ブロックで防いだ値）の％。端数は0に近いほうへ切り捨て。
+function reactionValue(rx, taken, blocked, stacks){
+  const mult = rx.perStack===false ? 1 : stacks;
+  if(rx.source==='fixed') return Math.trunc(Math.round(rx.amount*mult*1e6)/1e6);
+  const basis = rx.source==='blocked' ? blocked : taken;
+  return Math.trunc(Math.round(basis*rx.amount*mult*100)/10000);
+}
+function applyReaction(r, owner, attacker, st, a){
+  const ent = a.target==='self' ? owner : attacker;
+  if(!ent || a.v===0) return;
+  const isPlayer = ent===r.player, nm = isPlayer ? 'あなた' : ent.name, label = `${st.emoji||''}${st.name}`, v = a.v, f = a.field;
+  if(f==='damage'){
+    if(!(v>0) || ent.hp<=0) return;
+    const b = ent.hp; ent.hp = Math.max(0, ent.hp - v); fxLose(ent, b-ent.hp);
+    if(a.target==='self') pushLog(`${label}の効果で${nm}は${v}ダメージを受けた（HP ${b}→${ent.hp}）。`, isPlayer ? 'hit' : 'deal');
+    else pushLog(isPlayer ? `反射ダメージを${v}受けた（HP ${b}→${ent.hp}）。` : `${ent.name}は反射ダメージを${v}受けた（敵HP ${b}→${ent.hp}）。`, isPlayer ? 'hit' : 'deal');
+  } else if(f==='block'){
+    if(!(v>0)) return; ent.block += v; fxBlock(ent, v); pushLog(`${label}の効果で${nm}はブロックを${v}得た。`);
+  } else if(f==='heal'){
+    if(!(v>0) || ent.hp<=0) return; const b = ent.hp; ent.hp = Math.min(ent.maxHp, ent.hp + v); fxHeal(ent, ent.hp-b); pushLog(`${label}の効果で${nm}はHPを${ent.hp-b}回復した。`);
+  } else if(f==='draw'){
+    if(!isPlayer || !(v>0)) return; drawCards(v); pushLog(`${label}の効果でカードを${v}枚引いた。`);
+  } else if(f==='energy'){
+    if(!isPlayer || !(v>0)) return; r.player.energy += v; pushLog(`${label}の効果でエネルギーを${v}得た。`);
+  } else if(f.startsWith('cs_')){
+    const cs = (S.customStatuses||[]).find(x=>x.id===f.slice(3)); if(!cs) return;
+    if(grantCustomStatus(ent, cs.id, v)===0) return;
+    pushLog(`${label}の効果で${nm}は${cs.emoji||''}${cs.name}${v>0?'+':''}${v}。`);
+  } else if(BUILTIN_FIELD_ID[f]){
+    if(!(v>0) || grantBuiltin(ent, f, v)===0) return;
+    pushLog(`${label}の効果で${nm}は${bsName(BUILTIN_FIELD_ID[f])}+${v}。`);
+  }
+}
+// 攻撃を受けた owner の「攻撃を受けた時に反応する」状態をすべて発動する。hit は、その攻撃の結果（hpLoss＝HPが減った分、blocked＝ブロックで防いだ分）。
+function fireHitReactions(r, owner, attacker, hit){
+  if(!owner || !attacker || owner.hp<=0 || attacker.hp<=0) return;
+  const taken = Math.max(0, (hit && hit.hpLoss) || 0), blocked = Math.max(0, (hit && hit.blocked) || 0);
+  customEffectsOn(owner, 'reflectDamage').forEach(x=>{
+    const eff = x.eff, basis = eff.rxBasis || 'fixed';
+    const mag = customStatusMagnitude(eff, x.stacks);
+    const mainV = basis==='fixed' ? mag : Math.trunc(Math.round((basis==='blocked' ? blocked : taken)*mag*100)/10000);
+    const acts = [];
+    if(mainV>0) acts.push({field:'damage', target:eff.rxTarget || 'opponent', v:mainV});
+    (eff.reactions||[]).forEach(rx=>{ acts.push({field:rx.field, target:rx.target, v:reactionValue(rx, taken, blocked, x.stacks)}); });
+    acts.forEach(a=>{ if(owner.hp>0 && attacker.hp>0) applyReaction(r, owner, attacker, x.st, a); });
   });
 }
 // 自分のターン開始時に持ち越すブロック量。「ブロックを持ち越す」効果を持つ状態のうち、残せる量が最も大きいものを使う（足し算はしない）。
@@ -3486,14 +3606,14 @@ function applyEnemyCardPayload(r, e, c){
           else if(lh && lh.total>0) pushLog(`${e.name}の吸収: 全て防がれたので回復なし。`, 'guard');
         }
         flushElementNotes(lh);
-        const reflectTotal = bsAmt('thorns', p.thorns + p.permThorns) + customReflectDamage(p);
+        const reflectTotal = bsAmt('thorns', p.thorns + p.permThorns);
         if(reflectTotal>0){
           const eBefore = e.hp;
           e.hp = Math.max(0, e.hp - reflectTotal);
           fxLose(e, eBefore-e.hp);
           pushLog(`${e.name}は反射ダメージを${reflectTotal}受けた（敵HP ${eBefore}→${e.hp}）。`, 'deal');
         }
-        applyReflectGrants(p, e);   // 反射で、状態を与える設定のもの
+        fireHitReactions(r, p, e, lh);   // カスタム状態の「攻撃を受けた時の反応」
       },
       block(){
         const blk = V('block');
@@ -3920,7 +4040,7 @@ function resolveCardOp(r, op, done){
   // 「続けて行う操作」: まず本体の操作を行い、選ばれた（生成された）カードをインスタンスIDで追跡して、同じカードに順に続けの操作を行う
   if(op.then && op.then.length && !op._track){
     const track = [];
-    resolveCardOp(r, {...op, then:[], _track:track}, ()=> runThenOps(r, op.then, track, done));
+    resolveCardOp(r, {...op, then:[], _track:track, _guideThen:op.then}, ()=> runThenOps(r, op.then, track, done));
     return;
   }
   // The player never picks which card goes into the enemy's deck: "choose" acts as "fixed".
@@ -3990,6 +4110,7 @@ function resolveCardOp(r, op, done){
       need: k,
       selectedIdx: [],
       optional: !!op.pickOptional,
+      guide: cardOpGuide(op, {stage:'pick', total:selected.length, need:k}),   // 選択画面のガイド表示
       prompt: op.prompt || `${selected.length}枚から${k}枚を選んでください${op.pickOptional ? '（選ばなくてもよい）' : ''}`,
       onConfirm: (chosen)=>{
         if(chosen.length===0) pushLog('何も選ばなかったため、この操作は行われなかった。');
@@ -4279,6 +4400,7 @@ function resolveCardOp(r, op, done){
       candidates: entries,
       need,
       selectedIdx: [],
+      guide: cardOpGuide(op, {stage:'count', total:entries.length, need}),   // 選択画面のガイド表示
       prompt: op.prompt || '',
       onConfirm: (chosen)=>{ finish(chosen); },
     };
@@ -4370,14 +4492,14 @@ function applyEffectValues(r, c, onlyIds){
         else if(lh && lh.total>0) pushLog(`${c.name}: 吸収は全て防がれたので回復なし。`);
       }
       // 敵が持つカスタム状態の「反射」: 攻撃を受けた敵が、攻撃した側にダメージを返す（ブロック無視）
-      const foeReflect = r.enemy ? (bsAmt('thorns', (r.enemy.thorns||0) + (r.enemy.permThorns||0)) + customReflectDamage(r.enemy)) : 0;
+      const foeReflect = r.enemy ? bsAmt('thorns', (r.enemy.thorns||0) + (r.enemy.permThorns||0)) : 0;
       if(foeReflect>0 && r.enemy.hp>0 && r.player.hp>0){
         const pBefore = r.player.hp;
         r.player.hp = Math.max(0, r.player.hp - foeReflect);
         fxLose(r.player, pBefore-r.player.hp);
         pushLog(`反射ダメージを${foeReflect}受けた（HP ${pBefore}→${r.player.hp}）。`, 'hit');
       }
-      if(r.enemy && r.enemy.hp>0 && r.player.hp>0) applyReflectGrants(r.enemy, r.player);   // 反射で、状態を与える設定のもの
+      if(r.enemy) fireHitReactions(r, r.enemy, r.player, r.lastEnemyHit);   // カスタム状態の「攻撃を受けた時の反応」
     },
     block(){
       const blockVal = Math.max(0, (c.block||0) + scaleBonus(c,'block'));
@@ -5841,12 +5963,15 @@ let __formTab = 'current', __formMsg = '';
 function formSummary(f){
   const mt = f.mainId ? charTagById(f.mainId) : null;
   const n = new Set([...(f.unlocked||[]), ...(f.mainId ? [f.mainId] : [])].filter(id=>charTagById(id))).size;
-  return `メイン: ${mt ? escapeHtml(mt.name) : 'なし'} ・ 解放 ${n}種`;
+  const mm = effMainMode(f), slots = (f.unlockRandom||[]).filter(randomModeOn).length;
+  const mainText = mm==='random' ? '🎲 完全ランダム' : mm==='choose' ? '🎲 選択肢から選ぶ' : (mt ? escapeHtml(mt.name) : 'なし');
+  return `メイン: ${mainText} ・ 解放 ${n}種${slots ? ` ＋ ランダム${slots}枠` : ''}`;
 }
 function renderFormation(){
   const f = S.formation, tags = S.charTags || [];
   if(f.mainId && !charTagById(f.mainId)) f.mainId = '';
   f.unlocked = (f.unlocked||[]).filter(id=>charTagById(id));
+  const rndFull = !!S.settings.formationRandomFull, rndChoose = !!S.settings.formationRandomChoose, rnd = rndFull || rndChoose, rndMain = effMainMode(f);   // ランダムの選択肢は、ゲーム設定でオンのときだけ出す
   const tabB = __formTab==='presets';
   let html = `
   <div class="screen">
@@ -5865,12 +5990,15 @@ function renderFormation(){
     <p class="hint">ゲーム開始時に解放するキャラクタータグを決めます。解放したタグのカードが、報酬・ショップなどに出るようになります（ゲーム中に、解放レリックで増やすこともできます）。変更は、すぐ保存されます。</p>
     ${tags.length ? `
     <div class="section-label">メインキャラクター（1人。選ぶと、戦闘画面のプレイヤーの名前とアイコンが、そのキャラクターになります）</div>
-    <div class="checkbox-field"><label style="display:inline-flex; gap:6px; align-items:center;"><input type="radio" name="fm-main" value="" ${f.mainId?'':'checked'}>なし</label></div>
-    ${tags.map(t=>`<div class="checkbox-field"><label style="display:inline-flex; gap:6px; align-items:center;"><input type="radio" name="fm-main" value="${t.id}" ${f.mainId===t.id?'checked':''}>${charTagIconHTML(t,'🎭')} ${escapeHtml(t.name)}<span class="hint" style="margin:0;">（開始時のレリック: ${relicNamesOf(t.mainRelicIds).map(escapeHtml).join('、') || 'なし'}）</span></label></div>`).join('')}
-    <div class="checkbox-field"><input type="checkbox" id="fm-skip" ${f.skipMain?'checked':''} ${f.mainId?'':'disabled'}><label for="fm-skip">メインキャラクターのレリックを獲得しない（タグの解放だけ行う）</label></div>
+    <div class="checkbox-field"><label style="display:inline-flex; gap:6px; align-items:center;"><input type="radio" name="fm-main" value="" ${(rndMain==='fixed' && !f.mainId)?'checked':''}>なし</label></div>
+    ${rndFull ? `<div class="checkbox-field"><label style="display:inline-flex; gap:6px; align-items:center;"><input type="radio" name="fm-main" value="__random" ${rndMain==='random'?'checked':''}>🎲 ランダム（完全ランダム）<span class="hint" style="margin:0;">（ゲーム開始時に、キャラクターから1人が自動で決まる）</span></label></div>` : ''}
+    ${rndChoose ? `<div class="checkbox-field"><label style="display:inline-flex; gap:6px; align-items:center;"><input type="radio" name="fm-main" value="__choose" ${rndMain==='choose'?'checked':''}>🎲 ランダム（選択肢から選ぶ）<span class="hint" style="margin:0;">（ゲーム開始時に、ランダムな数人から1人を選ぶ）</span></label></div>` : ''}
+    ${tags.map(t=>`<div class="checkbox-field"><label style="display:inline-flex; gap:6px; align-items:center;"><input type="radio" name="fm-main" value="${t.id}" ${(rndMain==='fixed' && f.mainId===t.id)?'checked':''}>${charTagIconHTML(t,'🎭')} ${escapeHtml(t.name)}<span class="hint" style="margin:0;">（開始時のレリック: ${relicNamesOf(t.mainRelicIds).map(escapeHtml).join('、') || 'なし'}）</span></label></div>`).join('')}
+    <div class="checkbox-field"><input type="checkbox" id="fm-skip" ${f.skipMain?'checked':''} ${(f.mainId || rndMain!=='fixed')?'':'disabled'}><label for="fm-skip">メインキャラクターのレリックを獲得しない（タグの解放だけ行う）</label></div>
     <div class="section-label">開始時に解放するキャラクタータグ（メインは、いつも解放されます）</div>
     <div style="display:flex; gap:6px; margin-bottom:6px;"><button class="ghost" id="fm-all">すべて解放</button><button class="ghost" id="fm-none">すべて外す</button></div>
     ${tags.map(t=>{ const isMain = f.mainId===t.id; return `<div class="checkbox-field"><label style="display:inline-flex; gap:6px; align-items:center;"><input type="checkbox" data-tid="${t.id}" ${(isMain || f.unlocked.includes(t.id))?'checked':''} ${isMain?'disabled':''}>${charTagIconHTML(t,'🎭')} ${escapeHtml(t.name)}${isMain?'（メイン）':''}</label></div>`; }).join('')}
+    ${rnd ? randomSlotsHTML(f) : ''}
     <p class="hint">${formSummary(f)} ・ カード出現プール: キャラクター限定のカード ${open.length} / ${restricted.length}枚が出現（タグのないカード ${pool.length-restricted.length}枚は、常に出現）</p>
     <div class="section-label">この編成をプリセットに保存</div>
     <div style="display:flex; gap:8px; align-items:center;"><input type="text" id="fm-presetname" maxlength="30" placeholder="プリセット名" style="flex:1;"><button class="primary" id="fm-save">プリセットに保存</button></div>
@@ -5891,7 +6019,15 @@ function renderFormation(){
   qs('#fm-tab-current').onclick = ()=>{ __formTab='current'; __formMsg=''; renderFormation(); };
   qs('#fm-tab-presets').onclick = ()=>{ __formTab='presets'; __formMsg=''; renderFormation(); };
   if(!tabB){
-    qsa('input[name="fm-main"]').forEach(r=>{ r.onchange = ()=>{ f.mainId = r.value; saveFormation(); __formMsg=''; renderFormation(); }; });
+    qsa('input[name="fm-main"]').forEach(r=>{ r.onchange = ()=>{
+      if(r.value==='__random' || r.value==='__choose'){ f.mainMode = r.value==='__random' ? 'random' : 'choose'; f.mainId = ''; }
+      else { f.mainMode = 'fixed'; f.mainId = r.value; }
+      saveFormation(); __formMsg=''; renderFormation();
+    }; });
+    if(qs('#fm-add-random')) qs('#fm-add-random').onclick = ()=>{ f.unlockRandom = (f.unlockRandom||[]).concat('random').slice(0,8); saveFormation(); renderFormation(); };
+    if(qs('#fm-add-choose')) qs('#fm-add-choose').onclick = ()=>{ f.unlockRandom = (f.unlockRandom||[]).concat('choose').slice(0,8); saveFormation(); renderFormation(); };
+    qsa('[data-fm-delslot]').forEach(b=>{ b.onclick = ()=>{ const j = +b.dataset.fmDelslot; f.unlockRandom = (f.unlockRandom||[]).filter((_,k)=>k!==j); saveFormation(); renderFormation(); }; });
+    if(qs('#fm-choices')) qs('#fm-choices').onchange = e=>{ f.randomChoices = clampInt(e.target.value, 2, 6, 3); saveFormation(); renderFormation(); };
     if(qs('#fm-skip')) qs('#fm-skip').onchange = e=>{ f.skipMain = e.target.checked; saveFormation(); };
     qsa('input[data-tid]').forEach(c=>{ c.onchange = ()=>{ const id = c.dataset.tid; f.unlocked = f.unlocked.filter(x=>x!==id); if(c.checked) f.unlocked.push(id); saveFormation(); __formMsg=''; renderFormation(); }; });
     if(qs('#fm-all')) qs('#fm-all').onclick = ()=>{ f.unlocked = tags.map(t=>t.id); saveFormation(); renderFormation(); };
@@ -6010,7 +6146,6 @@ function newStatusEffect(kind){
   if(ELEMENT_ATTACH_KINDS.includes(kind)) e.element = ((S.elements||[])[0]||{}).id || '';
   if(kind==='revive'){ e.reviveUnit = 'percent'; e.magnitudeValue = 30; }
   if(kind==='keepBlock'){ e.magnitudeValue = 100; e.keepCap = 0; }
-  if(kind==='reflectDamage') e.reflectGive = 'damage';
   if(kind==='cardMod' || kind==='cardModPct'){ e.modField = 'damage'; e.modTag = ''; e.modTagMode = 'any'; e.decayOnUse = false; e.decayN = 1; }
   return e;
 }
@@ -6084,26 +6219,31 @@ function statusEffectFormHTML(eff, i){
       <label style="display:block; margin:6px 0;"><input type="checkbox" ${at} data-f="decayOnUse" ${eff.decayOnUse?'checked':''}> カードを使うたびにスタックを減らす（効果が出た使用だけ。タグを指定した場合は、そのタグのカードを使ったときだけ）</label>
       <div class="ev-eff-grid"><div><label>1回の使用で減らすスタック数</label><input type="number" ${at} data-f="decayN" data-num="1" value="${eff.decayN||1}" min="1" max="99"></div></div>
       <p class="ev-hint">${isPct ? '選んだ効果の値を、割合で増減します（端数は0に近いほうへ切り捨て）。固定値の増減を先に、％の増減をあとに計算します。' : ''}カスタム状態の付与を選ぶときは、「自分に与える分」「相手に与える分」「両方に与える分」を選べます。カードがその側に付与していない場合、固定値の増減ではその側への付与が新しく加わります（％の増減では、0のままです）。「付与（カードの付与先のまま）」は、カードに設定された付与量そのもの（両方に付与するカードでは、自分への量）を増減します。<br>状態を持っている本人（プレイヤーでも敵でも）が使うカードの、選んだ効果の値に上乗せします（元のカードは変わりません）。手札で表示されるカードの数字には反映されず、使ったときに働きます。使ったカードが予約（仕込み）なら、仕込んだ時点の値が発動のたびに使われます。複数の状態から同時に上乗せされる場合は、それぞれ別々に判定して減らします。「使うたびに減らす」は、タグが合わず効果が出なかった使用では減りません。</p>`;
-  } else if(eff.kind==='reflectDamage'){
-    const give = reflectGiveOf(eff);
-    const isDmg = give==='damage';
-    const csList = (S.customStatuses||[]);
-    const curMissing = give.startsWith('cs:') && !csList.some(s=>'cs:'+s.id===give);
-    const opt = (v, label)=>`<option value="${escapeHtml(v)}" ${give===v?'selected':''}>${escapeHtml(label)}</option>`;
-    body = `<div class="field"><label>何を与えるか（攻撃してきた相手に与えます）</label><select ${at} data-f="reflectGive" data-rerender="1">
-        ${opt('damage','ダメージ（ブロック無視）')}
-        <optgroup label="組み込みの状態">${REFLECT_BUILTIN_GIVES.map(id=>opt(id, bsName(id))).join('')}</optgroup>
-        ${csList.length||curMissing ? `<optgroup label="カスタム状態">${csList.map(s=>opt('cs:'+s.id, (s.emoji?s.emoji+' ':'')+s.name)).join('')}${curMissing ? opt(give,'（削除された状態）') : ''}</optgroup>` : ''}
-      </select></div>
-      ${magHTML(isDmg ? '反射ダメージ（固定値、または1スタックあたりの係数）' : '与えるスタック数（固定値、または1スタックあたりの係数。0以下なら与えません）')}
-      <p class="ev-hint">${isDmg
-        ? '攻撃を受けるたびに、攻撃した相手のHPを直接減らします（ブロック無視）。'
-        : '攻撃を受けるたびに、攻撃した相手へ、選んだ状態を付与します。排他の設定（カスタム状態）も働きます。「固定値」ならスタック数に関係なく同じ量、「スタック数×係数」ならこの状態のスタック数に比例した量を与えます（小数は切り捨て）。'}
-      攻撃1回（多段攻撃なら1ヒット）ごとに働きます。毒や棘など、攻撃以外のダメージでは働きません。1つの状態に、ダメージ用と状態用の効果を両方追加して、同時に働かせることもできます。敵が持っているときは、プレイヤーが攻撃するたびに、プレイヤーへ与えます。</p>`;
   } else if(eff.kind==='keepBlock'){
     body = `${magHTML('持ち越す割合（％。100ですべて、50で半分。固定値、または1スタックあたりの係数）')}
       <div class="ev-eff-grid"><div><label>持ち越す最大値（0で上限なし）</label><input type="number" ${at} data-f="keepCap" data-num="1" value="${eff.keepCap||0}" min="0" max="9999"></div></div>
       <p class="ev-hint">プレイヤーが持っているとき、自分のターン開始時に、前のターンの終わりに残っていたブロックのうち、割合ぶん（端数は切り捨て。最大値があれば、それまで）を残します。残りは消えます。そのあとに、自動ブロックなどで獲得するブロックが加わります。複数の状態を持っているときは、残せる量が最も大きいものを使います（足し算はしません）。敵のブロックは、もともと毎ターン持ち越されるので、敵が持っていても効果はありません。</p>`;
+  } else if(eff.kind==='reflectDamage'){
+    const rxSel = (j, key, cur, opts)=>`<select data-rx="${key}" data-i="${i}" data-j="${j}">${opts.map(o=>`<option value="${o[0]}" ${cur===o[0]?'selected':''}>${o[1]}</option>`).join('')}</select>`;
+    const rxRows = (eff.reactions||[]).map((g,j)=>`<div style="border:1px solid var(--line); border-radius:6px; padding:6px 8px; margin-bottom:6px;">
+        <div class="ev-add" style="gap:6px; flex-wrap:wrap;"><select data-rx="field" data-i="${i}" data-j="${j}">${reactionFieldOptionsHTML(g.field)}</select>
+          ${rxSel(j,'target',g.target,[['opponent','相手に（攻撃してきた側）'],['self','自分に（状態の持ち主）']])}</div>
+        <div class="ev-add" style="gap:6px; flex-wrap:wrap; margin-top:4px;">
+          ${rxSel(j,'source',g.source,[['fixed','値：固定値'],['taken','値：受けたダメージ（HPが減った分）の％'],['blocked','値：ブロックで防いだ値の％']])}
+          <input type="number" step="any" data-rx="amount" data-i="${i}" data-j="${j}" value="${g.amount}" style="width:90px;"><span>${g.source==='fixed' ? '' : '％'}</span>
+          <label><input type="checkbox" data-rx="perStack" data-i="${i}" data-j="${j}" ${g.perStack!==false?'checked':''}> スタック数をかける</label>
+          <button type="button" class="ghost" data-delrx="${i}:${j}">削除</button></div></div>`).join('');
+    body = `${magHTML((eff.rxBasis||'fixed')==='fixed' ? '返すダメージ（固定値、または1スタックあたりの係数。0にすると、ダメージは返しません）' : '返すダメージの％（基準の値に対する％。固定値、または1スタックあたりの係数。0にすると、ダメージは返しません）')}
+      <div class="field"><label>ダメージの値を決める基準</label><select ${at} data-f="rxBasis" data-rerender="1">
+        <option value="fixed" ${(eff.rxBasis||'fixed')==='fixed'?'selected':''}>固定値</option>
+        <option value="taken" ${eff.rxBasis==='taken'?'selected':''}>受けたダメージ（HPが減った分）の％</option>
+        <option value="blocked" ${eff.rxBasis==='blocked'?'selected':''}>ブロックで防いだ値の％</option></select></div>
+      <div class="field"><label>ダメージを与える先</label><select ${at} data-f="rxTarget">
+        <option value="opponent" ${eff.rxTarget!=='self'?'selected':''}>相手に（攻撃してきた側。ブロック無視）</option>
+        <option value="self" ${eff.rxTarget==='self'?'selected':''}>自分に（状態の持ち主）</option></select></div>
+      <div class="field"><label>追加の効果（攻撃を受けるたびに、上のダメージに加えて起こすこと。ダメージ・ブロック・回復・各種の状態・カスタム状態を選べます）</label>
+        ${rxRows}<button type="button" data-addrx="${i}">＋ 追加の効果</button></div>
+      <p class="ev-hint">敵の攻撃を受けたとき（プレイヤーが持つ場合）、またはプレイヤーの攻撃を受けたとき（敵が持つ場合）に発動します。「受けたダメージ」は、ブロックで防いだあとにHPが減った分、「ブロックで防いだ値」は、ブロックが受け止めた分です。％の計算は、端数を切り捨てます。「スタック数をかける」をオフにすると、スタックが何個あっても、1回分の値になります。「ドロー」「エネルギー」は、与える先がプレイヤーのときだけ働きます。</p>`;
   } else if(eff.kind!=='cardOp'){
     body = magHTML('効果量（固定値、または1スタックあたりの係数）');
   } else {
@@ -6253,11 +6393,21 @@ function openStatusModal(status, isNew){
     else if(t.type==='checkbox') obj[f] = t.checked;
     else obj[f] = t.value;
   }
+  function rxSync(t){
+    const eff = st.effects[+t.dataset.i]; const g = eff && eff.reactions && eff.reactions[+t.dataset.j]; if(!g) return false;
+    const k = t.dataset.rx;
+    if(k==='perStack') g[k] = t.checked;
+    else if(k==='amount'){ const v = parseFloat(t.value); g[k] = isNaN(v) ? 0 : v; }
+    else g[k] = t.value;
+    return true;
+  }
   box.addEventListener('input', e=>{
+    if(e.target.dataset && e.target.dataset.rx!==undefined){ rxSync(e.target); return; }
     if(e.target.dataset && e.target.dataset.gf){ const g = (st.effects[+e.target.dataset.i]||{}).reviveGrants||[]; if(g[+e.target.dataset.j]) g[+e.target.dataset.j].stacks = Math.max(1, Math.min(99, parseInt(e.target.value,10)||1)); return; }
     sync(e.target);
   });
   box.addEventListener('change', e=>{
+    if(e.target.dataset && e.target.dataset.rx!==undefined){ if(rxSync(e.target) && e.target.dataset.rx==='source') renderEffects(); return; }
     sync(e.target);
     if(e.target.dataset && e.target.dataset.rerender) renderEffects();
   });
@@ -6267,6 +6417,18 @@ function openStatusModal(status, isNew){
       const i = +ag.dataset.addgrant, eff = st.effects[i];
       const sel = box.querySelector(`select[data-grantpick="${i}"]`);
       if(eff && sel && sel.value){ (eff.reviveGrants = eff.reviveGrants||[]).push({statusId:sel.value, stacks:1}); renderEffects(); }
+      return;
+    }
+    const arx = e.target.closest('[data-addrx]');
+    if(arx){
+      const eff = st.effects[+arx.dataset.addrx];
+      if(eff){ (eff.reactions = eff.reactions||[]).push({field:'damage', target:'opponent', source:'fixed', amount:1, perStack:true}); renderEffects(); }
+      return;
+    }
+    const drx = e.target.closest('[data-delrx]');
+    if(drx){
+      const [i,j] = drx.dataset.delrx.split(':').map(Number);
+      const eff = st.effects[i]; if(eff && eff.reactions){ eff.reactions.splice(j,1); renderEffects(); }
       return;
     }
     const dg = e.target.closest('[data-delgrant]');
@@ -6340,6 +6502,9 @@ function openRelicModal(relic, isNew){
       </div>
       <div class="field"><label>開始時の所持数（0でなければ、ゲーム開始時にこの数だけ所持します）</label><input type="number" id="rm-startcount" value="${rel.startingCount||0}" min="0" max="9"></div>
       <div class="field"><label>解放するキャラクタータグ（このレリックを獲得すると解放されます。キャラクタータグの編集画面とつながっています）</label>${charTagChecksHTML('relic', (S.charTags||[]).filter(t=>(t.unlockRelicIds||[]).includes(rel.id)).map(t=>t.id))}</div>
+      <div class="field"><label>獲得時に入手するカード：任意（獲得時に欲しいカードを好きなだけ選べます。0枚でもよい）</label><div id="rm-grant-opt">${grantRowsHTML('opt', cleanIdListDup(rel.grantOptIds))}</div></div>
+      <div class="field"><label>獲得時に入手するカード：強制（すべて、必ずデッキに入ります）</label><div id="rm-grant-force">${grantRowsHTML('force', cleanIdListDup(rel.grantForceIds))}</div></div>
+      <div class="checkbox-field"><input type="checkbox" id="rm-grant-start" ${rel.grantAtStart?'checked':''}><label for="rm-grant-start">キャラクター編成でゲーム開始時に獲得するときは、任意・強制に関わらず、すべてデッキに入れる（追加演出なし。このとき、カード編集画面の開始デッキの指定は使わず、このレリックのカードだけで始める）</label></div>
       <div class="field"><label>発動タイミング</label>
         <select id="rm-timing">
           ${RELIC_TIMINGS.map(t=>`<option value="${t.key}" ${timing===t.key?'selected':''}>${t.label}</option>`).join('')}
@@ -6416,6 +6581,7 @@ function openRelicModal(relic, isNew){
     hint.style.display = relicTimingHint(t) ? '' : 'none';
   };
   bindTagPairs(overlay);
+  bindGrantRows(overlay);
   qs('#rm-save',overlay).onclick = ()=>{
     const t = qs('#rm-timing',overlay).value;
     const updated = {
@@ -6432,6 +6598,7 @@ function openRelicModal(relic, isNew){
       useLimit: qs('#rm-limited',overlay).checked ? clampInt(qs('#rm-uselimit',overlay).value,1,99,1) : 0,
       useScope: qs('#rm-usescope',overlay).value,
       shopPrice: clampInt(qs('#rm-shopprice',overlay).value,0,9999,0),
+      grantOptIds: readGrantRows(overlay,'opt').filter(Boolean), grantForceIds: readGrantRows(overlay,'force').filter(Boolean), grantAtStart: qs('#rm-grant-start',overlay).checked,
       useCardIds: (t==='combatStart'||t==='turnStart') ? useCardIds.slice() : [],
       turnCond: t==='turnStart' ? qs('#rm-turncond',overlay).value : 'always',
       turnN: clampInt(qs('#rm-turnn',overlay).value,1,99,1),
@@ -7245,10 +7412,11 @@ function openCardModal(card, isNew, opts){
 
 /* ============================= RUN / BATTLE LOGIC ============================= */
 
-function buildStartingDeck(){
+function buildStartingDeck(exclude){
   const deck = [];
   S.cards.forEach(c=>{
     if(isNonRewardCard(c)) return;
+    if(exclude && exclude.has(c.id)) return;   // キャラクターレリックの「開始時に獲得」で入るカードは、開始デッキの指定の代わりになる
     for(let i=0;i<(c.startingCount||0);i++) deck.push(c.id);
   });
   if(deck.length===0){ // fallback safety
@@ -7733,6 +7901,86 @@ function makeEnemy(floorIndex, forcedCategory, scaleIndex){
   return runtimeEnemy;
 }
 
+// ===== キャラクター編成の「ランダム」 =====
+// ゲーム設定「キャラクター編成にランダムの選択肢を出す」（formationRandom）がオンのときだけ、編成画面に出て、ゲーム開始時に働く（オフのときは、固定の編成だけ）。
+// メイン枠: mainMode＝'fixed'（既定。mainId を使う）／'random'（完全ランダム：全キャラクターから1人が自動で決まる）／'choose'（選択肢から選ぶ：ランダムな数人から1人を選ぶ）。
+// 解放の枠: unlockRandom＝['random'|'choose', …]（最大8）。それぞれ、まだ解放されていない（メイン・固定の解放でない）キャラクターから、1人を解放する。
+// 選択肢の数は randomChoices（2〜6）。ランダムに決まった内容は、S.run.startFormation に記録する（この探索の編成。S.formation は変えない）。
+// 完全ランダム（formationRandomFull）と選択肢から選ぶ（formationRandomChoose）は、ゲーム設定の項目ごとにオン／オフ。オフのものは、編成画面に出ず、ゲーム開始時にも働かない。
+function randomModeOn(m){ return !!S.settings && ((m==='random' && !!S.settings.formationRandomFull) || (m==='choose' && !!S.settings.formationRandomChoose)); }
+function effMainMode(f){ return randomModeOn(f.mainMode) ? f.mainMode : 'fixed'; }
+function resolveStartFormation(done){
+  const f = S.formation || {}, tags = S.charTags || [];
+  const eff = {mainId: (f.mainId && charTagById(f.mainId)) ? f.mainId : '', skipMain: !!f.skipMain, unlocked: (f.unlocked||[]).filter(id=>charTagById(id))};
+  const steps = [];
+  if(tags.length){
+    const mm = effMainMode(f);
+    if(mm!=='fixed'){ eff.mainId = ''; steps.push({kind:'main', mode:mm}); }
+    (f.unlockRandom||[]).forEach(m=>{ if(randomModeOn(m)) steps.push({kind:'unlock', mode:m}); });
+  }
+  if(!steps.length){ done(eff); return; }
+  const nOpt = clampInt(f.randomChoices, 2, 6, 3), picks = [];
+  const next = ()=>{
+    const st = steps.shift();
+    if(!st){
+      if(picks.some(p=>p.mode==='random')) renderFormationRandomSummary(picks, ()=>done(eff)); else done(eff);
+      return;
+    }
+    const taken = new Set([eff.mainId, ...eff.unlocked].filter(Boolean));
+    const cands = st.kind==='main' ? tags.slice() : tags.filter(t=>!taken.has(t.id));
+    if(!cands.length){ next(); return; }
+    const take = (t, mode)=>{
+      if(st.kind==='main') eff.mainId = t.id; else eff.unlocked.push(t.id);
+      picks.push({kind:st.kind, mode, name:t.name, icon:charTagIconHTML(t,'🎭')});
+      next();
+    };
+    if(st.mode==='random'){ take(cands[Math.floor(Math.random()*cands.length)], 'random'); return; }
+    const opts = shuffle(cands.slice()).slice(0, nOpt);
+    if(opts.length===1){ take(opts[0], 'random'); return; }   // 選択肢が1つしかないときは、そのまま決まる
+    renderFormationPick(st.kind, opts, t=> take(t, 'choose'));
+  };
+  next();
+}
+function renderFormationPick(kind, options, onPick){
+  const isMain = kind==='main';
+  app().innerHTML = `
+  <div class="screen center-screen">
+    <p class="eyebrow">PROLOGUE</p>
+    <h2>${isMain ? 'メインキャラクターを選べ' : '解放するキャラクターを選べ'}</h2>
+    <p style="color:var(--parchment-dim); margin-top:6px;">${isMain ? '1人選ぶ。そのキャラクターのレリックを獲得し、カードが解放される。' : '1人選ぶ。そのキャラクターのカードが解放される。'}</p>
+    <div style="display:flex; gap:14px; justify-content:center; flex-wrap:wrap; margin-top:18px;" id="fmpick-row">
+      ${options.map((t,i)=>{
+        const n = S.cards.filter(c=>(c.charTags||[]).includes(t.id) && c.rarity!=='basic' && !isNonRewardCard(c)).length;
+        return `<div data-idx="${i}" style="width:210px; cursor:pointer; border:2px solid var(--gold); border-radius:8px; padding:14px; text-align:center; background:var(--bg-panel-raised);">
+        <div style="font-size:30px;">${charTagIconHTML(t,'🎭')}</div>
+        <div style="font-family:var(--font-display); font-size:15px; color:var(--gold); margin-top:4px;">${escapeHtml(t.name)}</div>
+        <div style="font-size:12px; color:var(--parchment-dim); margin-top:8px;">${isMain ? `開始時のレリック: ${relicNamesOf(t.mainRelicIds).map(escapeHtml).join('、') || 'なし'}<br>` : ''}専用カード ${n}枚が解放</div>
+      </div>`; }).join('')}
+    </div>
+  </div>`;
+  qsa('#fmpick-row > div').forEach(w=>{ w.onclick = ()=>{ const t = options[parseInt(w.dataset.idx,10)]; if(t) onPick(t); }; });
+}
+function renderFormationRandomSummary(picks, next){
+  app().innerHTML = `
+  <div class="screen center-screen">
+    <p class="eyebrow">PROLOGUE</p>
+    <h2>今回のキャラクター</h2>
+    <p style="color:var(--parchment-dim); margin-top:6px;">ランダムで決まった内容です。</p>
+    <div style="max-width:420px; margin:14px auto; text-align:left;">
+      ${picks.map(p=>`<div class="checkbox-field"><span style="color:var(--gold);">${p.kind==='main' ? 'メイン' : '解放'}</span>　${p.icon} ${escapeHtml(p.name)}<span class="hint" style="margin-left:8px;">${p.mode==='choose' ? '（選んだ）' : '（ランダム）'}</span></div>`).join('')}
+    </div>
+    <div style="margin-top:12px;"><button class="primary" id="btn-fmsum-go">進む</button></div>
+  </div>`;
+  qs('#btn-fmsum-go').onclick = ()=> next();
+}
+function randomSlotsHTML(f){
+  const slots = f.unlockRandom || [];
+  return `<div class="section-label">ランダムで解放する枠（ゲーム開始時に、まだ解放されていないキャラクターから1人ずつ決まります）</div>
+    ${slots.length ? slots.map((m,j)=>`<div class="checkbox-field" style="display:flex; gap:8px; align-items:center;"><span style="flex:1;">枠${j+1}：🎲 ${m==='random' ? '完全ランダム' : '選択肢から選ぶ'}</span><button type="button" class="ghost" data-fm-delslot="${j}">削除</button></div>`).join('') : '<p class="hint">枠がありません。</p>'}
+    <div style="display:flex; gap:6px; flex-wrap:wrap; margin:6px 0;">${S.settings.formationRandomFull ? `<button type="button" class="ghost" id="fm-add-random" ${slots.length>=8?'disabled':''}>＋ 完全ランダムの枠</button>` : ''}${S.settings.formationRandomChoose ? `<button type="button" class="ghost" id="fm-add-choose" ${slots.length>=8?'disabled':''}>＋ 選択肢から選ぶ枠</button>` : ''}</div>
+    <div class="field" style="max-width:300px;"><label>「選択肢から選ぶ」の選択肢の数（2〜6。メインの枠にも使います）</label><input type="number" id="fm-choices" min="2" max="6" value="${clampInt(f.randomChoices,2,6,3)}"></div>
+    <p class="hint">「完全ランダム」は、キャラクターが自動で決まります。「選択肢から選ぶ」は、ランダムに選ばれた数人の中から、ゲーム開始時に1人を選びます。メインがランダムのときは、そのキャラクターのレリックを獲得します（「獲得しない」のチェックも有効）。この項目は、ゲーム設定でオフにすると、編成画面に出ず、ゲーム開始時にも働きません。</p>`;
+}
 function startRun(){
   const deckIds = buildStartingDeck();
   S.run = {
@@ -7787,13 +8035,30 @@ function startRun(){
   showIntroThen(()=> startRunBody());
 }
 function startRunBody(){
+  // キャラクター編成のランダム（オンのときだけ）を決めてから、開始時のレリックを獲得する
+  resolveStartFormation(eff=>{
+    if(S.run){
+      S.run.startFormation = eff;
+      S.run.mainCharTagId = (eff.mainId && charTagById(eff.mainId)) ? eff.mainId : '';
+      S.run.charTagsUnlocked = [...new Set([...(eff.unlocked||[]), ...(eff.mainId ? [eff.mainId] : [])])].filter(id=>charTagById(id));
+    }
+    // キャラクターのレリックが「開始時に獲得」で、カードを持つとき、既定の開始デッキ（カード編集の枚数指定）は使わず、そのレリックのカードだけで始める（カードは applyRelicCards が入れる）
+    if(S.run){
+      const mt = (!eff.skipMain && eff.mainId) ? charTagById(eff.mainId) : null;
+      const usesGrant = !!mt && (mt.mainRelicIds||[]).some(rid=>{ const rel = S.relics.find(x=>x.id===rid); return !!rel && rel.grantAtStart && (relicCardIds(rel,'opt').length + relicCardIds(rel,'force').length) > 0; });
+      if(usesGrant) S.run.draw = [];
+    }
+    startRunBodyMain();
+  });
+}
+function startRunBodyMain(){
   // 最初から所持しているレリック
   S.relics.forEach(rel=>{
-    for(let i=0;i<(rel.startingCount|0);i++) applyRelicEffect(S.run, rel);
+    for(let i=0;i<(rel.startingCount|0);i++) applyRelicEffect(S.run, rel, {start:true, cards:i===0});
   });
   { // メインキャラクターの、開始時のレリック
-    const f = S.formation || {}, mt = f.mainId ? charTagById(f.mainId) : null;
-    if(mt && !f.skipMain) (mt.mainRelicIds||[]).forEach(rid=>{ const rel = S.relics.find(x=>x.id===rid); if(rel && !S.run.player.relics.includes(rel.id)) applyRelicEffect(S.run, rel); });
+    const f = (S.run && S.run.startFormation) || S.formation || {}, mt = f.mainId ? charTagById(f.mainId) : null;
+    if(mt && !f.skipMain) (mt.mainRelicIds||[]).forEach(rid=>{ const rel = S.relics.find(x=>x.id===rid); if(rel && !S.run.player.relics.includes(rel.id)) applyRelicEffect(S.run, rel, {start:true, formation:true}); });
   }
   if(S.settings.startRelicPickEnabled){ S.screen='startRelicPick'; renderStartRelicPick(); return; }
   afterStartRelics();
@@ -7854,7 +8119,7 @@ function renderStartRelicPick(){
     w.onclick = ()=>{
       applyRelicEffect(r, choices[parseInt(w.dataset.idx,10)]);
       r.startRelicChoices = null;
-      afterStartRelics();
+      flushRelicCardPicks(()=>afterStartRelics());
     };
   });
 }
@@ -8439,6 +8704,7 @@ function advanceFloor(){
   r.floor++; beginFloorLegacy();
 }
 function renderMap(){
+  if(S.run && S.run.relicCardPicks && S.run.relicCardPicks.length){ flushRelicCardPicks(()=>renderMap()); return; }   // 獲得時の任意カードの選択が残っていれば、先に選ばせる
   const r = S.run, m = r.map, W = m.width, H = m.rows*MAP_ROW_H;
   const sel = new Set(mapSelectable(r)), cur = m.current ? m.nodes[m.current] : null;
   const xOf = n=> (n.col+0.5)/W*100, yOf = n=> (n.row-0.5)*MAP_ROW_H;
@@ -9125,9 +9391,18 @@ function customEffectText(eff, stacks){
     case 'turnStartDamage': return `ターン開始時に${fmtNum(Math.max(0,mag))}ダメージを受ける${per}`;
     case 'turnStartHeal':   return `ターン開始時にHPが${fmtNum(Math.max(0,mag))}回復${per}`;
     case 'reflectDamage': {
-      const give = reflectGiveOf(eff);
-      if(give==='damage') return `攻撃を受けるたびに、相手に${fmtNum(mag)}の反射ダメージ${per}`;
-      return `攻撃を受けるたびに、相手に${escapeHtml(reflectGiveName(give))}を${fmtNum(Math.max(0,mag))}付与${per}`;
+      const tgt = t=> t==='self' ? '自分' : '相手';
+      const parts = [];
+      const bs = eff.rxBasis || 'fixed';
+      if(mag>0 || !(eff.reactions||[]).length){
+        if(bs==='fixed') parts.push(`${tgt(eff.rxTarget)}に${fmtNum(mag)}の${eff.rxTarget==='self' ? 'ダメージ' : '反射ダメージ'}`);
+        else parts.push(`${bs==='taken' ? '受けたダメージ' : 'ブロックで防いだ値'}の${fmtNum(mag)}％を${tgt(eff.rxTarget)}にダメージ`);
+      }
+      (eff.reactions||[]).forEach(g=>{
+        const val = g.source==='fixed' ? `${fmtNum(g.amount)}` : `${g.source==='taken' ? '受けたダメージ' : 'ブロックで防いだ値'}の${fmtNum(g.amount)}％`;
+        parts.push(`${tgt(g.target)}に「${escapeHtml(reactionFieldLabel(g.field))}」（値：${val}${g.perStack===false ? '' : '×スタック数'}）`);
+      });
+      return `攻撃を受けるたびに、${parts.join('、')}${per}`;
     }
     case 'skipTurn':        return `自分のターンを休む（発動のたびにスタックが1減ります）`;
     case 'cardMod': case 'cardModPct': {
@@ -9386,6 +9661,7 @@ function renderCardChoiceOverlay(r){
     <p class="eyebrow">CHOICE</p>
     <h2>カードを選択（${selected.length} / ${pc.need}）</h2>
     ${pc.prompt ? `<p style="color:var(--parchment-dim); margin:6px 0 10px;">${escapeHtml(pc.prompt)}</p>` : ''}
+    ${cardOpGuideHTML(pc.guide)}
     <div class="reward-row" id="choice-row">
       ${pc.candidates.map((e,i)=>{
         const c = cardById(e.rawId);
@@ -9682,7 +9958,7 @@ function relicLimitText(relic){
 }
 
 function relicDescription(relic){
-  const base = relicDescriptionBase(relic);
+  const base = [relicDescriptionBase(relic), relicGrantText(relic)].filter(Boolean).join(' ');
   const ut = (S.charTags||[]).filter(t=>(t.unlockRelicIds||[]).includes(relic.id)).map(t=>t.name);
   return ut.length ? `${base}${base ? ' ' : ''}キャラクタータグ「${ut.join('」「')}」を解放する。` : base;
 }
@@ -9845,9 +10121,101 @@ function applyCombatEndRelic(r, relic, e){
   });
 }
 
-function applyRelicEffect(r, relic){
+// ===== レリックの「獲得時に入手するカード」 =====
+// grantOptIds（任意：獲得時に欲しいものを好きなだけ選ぶ）／grantForceIds（強制：必ずデッキに入る）／grantAtStart（キャラクター編成でゲーム開始時に獲得するとき、任意・強制に関わらずすべて入れる。追加演出なし。開始デッキの枚数指定の代わりになる）
+// 同じカードを複数入れられるので、重複は除かない（空欄と、存在しないIDは除く）
+function cleanIdListDup(a){ return Array.isArray(a) ? a.filter(x=>typeof x==='string' && validSaveId(x)).slice(0,30) : []; }
+function relicCardIds(relic, kind){
+  const src = kind==='opt' ? relic.grantOptIds : relic.grantForceIds;
+  return cleanIdListDup(src).filter(id=>S.cards.some(c=>c.id===id));
+}
+function relicGrantText(relic){
+  const names = ids => ids.map(id=>{ const c = S.cards.find(x=>x.id===id); return c ? `「${c.name}」` : null; }).filter(Boolean).join('、');
+  const f = relicCardIds(relic,'force'), o = relicCardIds(relic,'opt'), parts = [];
+  if(f.length) parts.push(`獲得時、${names(f)}を必ずデッキに入れる`);
+  if(o.length) parts.push(`獲得時、${names(o)}から欲しいカードを好きなだけ選んで入手できる`);
+  if(parts.length && relic.grantAtStart) parts.push('キャラクター編成でゲーム開始時に獲得するときは、すべて入手し、既定の開始デッキは使わない');
+  return parts.length ? parts.join('。')+'。' : '';
+}
+function applyRelicCards(r, relic, opts){
+  opts = opts || {};
+  if(opts.cards===false) return;
+  const forced = relicCardIds(relic,'force'), opt = relicCardIds(relic,'opt');
+  if(!forced.length && !opt.length) return;
+  if(opts.formation && relic.grantAtStart){   // 追加演出なしで、すべて入れる（開始デッキの指定の代わり）
+    [...forced, ...opt].forEach(id=> r.draw.push(id));
+    r.draw = shuffle(r.draw);
+    return;
+  }
+  if(forced.length){
+    if(opts.start){ forced.forEach(id=> r.draw.push(id)); r.draw = shuffle(r.draw); }
+    else{
+      forced.forEach(id=>{ r.discard.push(id); noteCardAcquired(r, id); });
+      pushLog(`「${relic.name}」の効果で、${forced.map(id=>`「${S.cards.find(c=>c.id===id).name}」`).join('、')}をデッキに入れた。`);
+    }
+  }
+  if(opt.length){   // 任意は、選ぶ画面を次の区切りで出す（flushRelicCardPicks）
+    if(!r.relicCardPicks) r.relicCardPicks = [];
+    r.relicCardPicks.push({name: relic.name, ids: opt});
+  }
+}
+function flushRelicCardPicks(next){
+  const r = S.run, q = r && r.relicCardPicks;
+  if(!q || !q.length){ next(); return; }
+  const item = q.shift();
+  renderRelicCardPick(item, ()=> flushRelicCardPicks(next));
+}
+function renderRelicCardPick(item, next){
+  const r = S.run;
+  const entries = item.ids.map(id=>S.cards.find(c=>c.id===id)).filter(Boolean);
+  if(!entries.length){ next(); return; }
+  app().innerHTML = `
+  <div class="screen center-screen">
+    <p class="eyebrow">RELIC</p>
+    <h2>「${escapeHtml(item.name)}」の獲得カード</h2>
+    <p style="color:var(--parchment-dim); margin-top:6px;">欲しいカードを、好きなだけ選べます（0枚でもよい）。選んだカードは、デッキに入ります。</p>
+    <div style="display:flex; gap:6px; justify-content:center; margin:12px 0;"><button class="ghost" id="rcp-all">すべて選ぶ</button><button class="ghost" id="rcp-none">すべて外す</button></div>
+    <div style="display:flex; flex-wrap:wrap; gap:8px; justify-content:center; max-width:760px; margin:0 auto;">
+      ${entries.map((c,i)=>`<label style="cursor:pointer; border:2px solid var(--line); border-radius:8px; padding:10px 12px; width:180px; text-align:left; background:var(--bg-panel-raised);"><input type="checkbox" data-rcpi="${i}" style="margin-right:6px;"><b>${escapeHtml(c.name)}</b><div class="hint" style="margin:4px 0 0;">${escapeHtml(TYPE_TAG_NAME[c.type]||'')}${c.rarity==='basic'?' ・ベーシック':''}</div></label>`).join('')}
+    </div>
+    <div style="margin-top:18px;"><button class="primary" id="rcp-ok">決定</button></div>
+  </div>`;
+  qs('#rcp-all').onclick = ()=> qsa('[data-rcpi]').forEach(x=>{ x.checked = true; });
+  qs('#rcp-none').onclick = ()=> qsa('[data-rcpi]').forEach(x=>{ x.checked = false; });
+  qs('#rcp-ok').onclick = ()=>{
+    const picked = qsa('[data-rcpi]').filter(x=>x.checked).map(x=>entries[parseInt(x.dataset.rcpi,10)]);
+    picked.forEach(c=>{ r.discard.push(c.id); noteCardAcquired(r, c.id); });
+    if(picked.length) pushLog(`「${item.name}」の効果で、${picked.map(c=>`「${c.name}」`).join('、')}を獲得した。`);
+    next();
+  };
+}
+// 追加式の編集欄（同じカードを何枚でも入れられる）。ids は重複・空欄を含んだまま描画する
+function grantRowsHTML(kind, ids){
+  const cards = S.cards.filter(c=>!isNonRewardCard(c));
+  const opts = sel => `<option value="">（カードを選ぶ）</option>` + cards.map(x=>`<option value="${escapeHtml(x.id)}" ${x.id===sel?'selected':''}>${escapeHtml(x.name)}（${escapeHtml(TYPE_TAG_NAME[x.type]||'')}${x.rarity==='basic'?' ・ベーシック':''}）</option>`).join('');
+  const list = Array.isArray(ids) ? ids : [];
+  return `${list.map((id,i)=>`<div style="display:flex; gap:6px; margin:4px 0; align-items:center;"><select data-grow="${kind}" style="flex:1;">${opts(id)}</select><button type="button" class="ghost" data-gdel="${kind}" data-gi="${i}">削除</button></div>`).join('')}
+  <div><button type="button" class="ghost" data-gadd="${kind}" ${list.length>=GRANT_MAX?'disabled':''}>＋ カードを追加</button>${list.length ? '' : '<span class="hint" style="margin-left:8px;">（なし）</span>'}</div>`;
+}
+const GRANT_MAX = 30;
+// 行の値を、空欄を含めてそのまま読む（削除・追加の位置を合わせるため）
+function readGrantRows(root, kind){ return qsa(`select[data-grow="${kind}"]`, root).map(x=>x.value); }
+// 追加・削除の操作は、編集欄の中だけを描き直す（入力中の他の値は、画面から読み直して保つ）
+function bindGrantRows(overlay){
+  overlay.addEventListener('click', e=>{
+    const add = e.target.closest && e.target.closest('[data-gadd]'), del = e.target.closest && e.target.closest('[data-gdel]');
+    if(!add && !del) return;
+    const kind = add ? add.dataset.gadd : del.dataset.gdel;
+    const ids = readGrantRows(overlay, kind);
+    if(add){ if(ids.length>=GRANT_MAX) return; ids.push(''); }
+    else ids.splice(parseInt(del.dataset.gi,10), 1);
+    qs(`#rm-grant-${kind}`, overlay).innerHTML = grantRowsHTML(kind, ids);
+  });
+}
+function applyRelicEffect(r, relic, opts){
   r.player.relics.push(relic.id);
   unlockCharTagsByRelic(r, relic.id);
+  applyRelicCards(r, relic, opts);   // 獲得時に入手するカード（タイミングに関係なく）
   if((relic.timing||'onPickup') !== 'onPickup') return; // recurring relics fire later, from fireRelicTiming
   const e = relic.effect || {};
   applyRelicMeta(r, relic, e, 'pickup');
@@ -9877,7 +10245,7 @@ function renderRelicReward(){
     </div>
     ${battleLogDetails(r, false)}
   </div>`;
-  qs('#btn-relic-take').onclick = ()=>{ applyRelicEffect(r, rel); r.pendingRelic=null; S.screen='reward'; renderReward(); };
+  qs('#btn-relic-take').onclick = ()=>{ applyRelicEffect(r, rel); r.pendingRelic=null; flushRelicCardPicks(()=>{ S.screen='reward'; renderReward(); }); };
   qs('#btn-relic-skip').onclick = ()=>{ r.pendingRelic=null; S.screen='reward'; renderReward(); };
 }
 
@@ -10695,7 +11063,7 @@ function renderShop(){
         r.player.gold -= price;
         applyRelicEffect(r, rl);
         rl.sold = true;
-        renderShop();
+        flushRelicCardPicks(()=>renderShop());
       };
     });
     if(qs('#btn-shop-reroll')) qs('#btn-shop-reroll').onclick = ()=>{
